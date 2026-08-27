@@ -1,11 +1,14 @@
 import os
 import json
+import re
+import time
 import traceback
 from flask import Flask, request, abort
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -83,6 +86,100 @@ def get_books_context(limit=30):
         print(f"❌ Firestore Read Error: {e}")
         traceback.print_exc()
         return "ไม่มีข้อมูลหนังสือในระบบ"
+
+
+def clean_markdown(text):
+    """
+    ลบสัญลักษณ์ Markdown ที่ Gemini ชอบใส่มา (LINE ไม่รองรับการแสดงผล Markdown)
+    เช่น **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, - จุดนำหน้า และจัดการเว้นบรรทัดให้อ่านง่ายขึ้น
+    """
+    if not text:
+        return text
+
+    # ลบตัวหนา/ตัวเอียงแบบ Markdown: **text**, *text*, __text__, _text_
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+
+    # ลบสัญลักษณ์หัวข้อ Markdown (#, ##, ###)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+
+    # แปลงจุดนำหน้าแบบ Markdown (-, *) ให้เป็นจุดไทยที่อ่านง่ายขึ้น
+    text = re.sub(r"^[\*\-]\s+", "• ", text, flags=re.MULTILINE)
+
+    # ลบดอกจัน/สัญลักษณ์ที่หลงเหลืออยู่เดี่ยวๆ
+    text = text.replace("**", "").replace("##", "").replace("###", "")
+
+    # จัดการบรรทัดว่างซ้ำๆ ให้เหลือแค่ 1 บรรทัดว่างระหว่างย่อหน้า
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # ลบช่องว่างท้ายบรรทัดที่ไม่จำเป็น
+    lines = [line.rstrip() for line in text.split("\n")]
+    text = "\n".join(lines).strip()
+
+    return text
+
+
+def get_category_summary():
+    """
+    นับหมวดหมู่หนังสือจริงจาก Firestore (ไม่ให้ Gemini เดาเอง)
+    คืนค่าเป็นข้อความสรุปจำนวนหมวดหมู่ทั้งหมด พร้อมรายชื่อหมวดหมู่และจำนวนเล่มในแต่ละหมวด
+    """
+    try:
+        books_ref = db.collection("books")
+        docs = books_ref.stream()
+        category_counts = {}
+        for doc in docs:
+            b = doc.to_dict()
+            category = b.get("category", "ไม่ระบุหมวดหมู่")
+            category_counts[category] = category_counts.get(category, 0) + 1
+
+        if not category_counts:
+            return "ยังไม่มีข้อมูลหมวดหมู่หนังสือในระบบ"
+
+        total_categories = len(category_counts)
+        lines = [f"ห้องสมุดมีหนังสือทั้งหมด {total_categories} หมวดหมู่ ได้แก่:"]
+        for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"- {cat} ({count} เล่ม)")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"❌ Firestore Category Count Error: {e}")
+        traceback.print_exc()
+        return "ไม่สามารถดึงข้อมูลหมวดหมู่ได้ในขณะนี้"
+
+
+def call_gemini_with_retry(prompt, max_retries=1):
+    """
+    เรียก Gemini API พร้อม retry อัตโนมัติเมื่อโดน rate limit (ResourceExhausted / 429)
+    Google Gemini free tier มีโควต้าจำกัดต่อนาที ถ้าโดน limit จะบอกเวลาที่ต้องรอ (retry_delay)
+    เรารอตามเวลานั้นแล้วลองใหม่อัตโนมัติ 1 ครั้ง ก่อนจะยอมแพ้และคืนค่า None
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except ResourceExhausted as e:
+            print(f"\n⚠️ Gemini Rate Limit (attempt {attempt + 1}/{max_retries + 1}):")
+            traceback.print_exc()
+            if attempt < max_retries:
+                # พยายามอ่านเวลาที่ Google แนะนำให้รอจาก error, ถ้าไม่มีให้รอ default 15 วินาที
+                wait_seconds = 15
+                try:
+                    retry_info = getattr(e, "retry_delay", None)
+                    if retry_info and hasattr(retry_info, "seconds"):
+                        wait_seconds = retry_info.seconds
+                except Exception:
+                    pass
+                print(f"⏳ รอ {wait_seconds} วินาทีก่อนลองใหม่...")
+                time.sleep(min(wait_seconds, 45))  # ไม่รอเกิน 45 วิ กัน LINE reply token หมดอายุ
+            else:
+                return None
+        except Exception as e:
+            print("\n❌ Gemini Error Details:")
+            traceback.print_exc()
+            return None
+    return None
 
 
 def save_user_interaction(user_id, user_message, ai_response):
@@ -173,19 +270,27 @@ def handle_message(event):
     user_msg = event.message.text.strip()
 
     books_context = get_books_context()
+    category_summary = get_category_summary()
 
     prompt = f"""
     คุณคือ 'บรรณารักษ์อัจฉริยะ' ประจำหอสมุดกลาง มหาวิทยาลัยราชภัฏสุราษฎร์ธานี (SRU Library)
     ให้บริการแก่นักศึกษา อาจารย์ บุคลากร และบุคคลภายนอก
 
     กฎสำคัญในการตอบคำถาม:
-    1. **ห้ามกล่าวทักทายยาวๆ ซ้ำซ้อน** เช่น "สวัสดีค่ะ ยินดีต้อนรับสู่หอสมุดกลาง..." ในทุกๆ คำตอบ
-    2. ให้กล่าวทักทาย "สวัสดีค่ะ/ครับ" **เฉพาะเมื่อผู้ใช้ทักทายมาก่อนเท่านั้น** (เช่น พิมพ์ สวัสดี, หวัดดี, Hello)
-    3. หากผู้ใช้ถามข้อมูล ค้นหาหนังสือ หรือสอบถามบริการ **ให้ตอบเข้าประเด็นทันที** ด้วยคำพูดที่เป็นธรรมชาติ สุภาพ กระชับ ไม่เยิ่นย้อ
-    4. อ้างอิงข้อมูลหนังสือจากฐานข้อมูลนี้เมื่อผู้ใช้ถามหาหนังสือ:
+    1. ห้ามกล่าวทักทายยาวๆ ซ้ำซ้อน เช่น "สวัสดีค่ะ ยินดีต้อนรับสู่หอสมุดกลาง..." ในทุกๆ คำตอบ
+    2. ให้กล่าวทักทาย "สวัสดีค่ะ/ครับ" เฉพาะเมื่อผู้ใช้ทักทายมาก่อนเท่านั้น (เช่น พิมพ์ สวัสดี, หวัดดี, Hello)
+    3. หากผู้ใช้ถามข้อมูล ค้นหาหนังสือ หรือสอบถามบริการ ให้ตอบเข้าประเด็นทันที ด้วยคำพูดที่เป็นธรรมชาติ สุภาพ กระชับ เป็นกันเอง ไม่เยิ่นย้อ
+    4. อ้างอิงข้อมูลหนังสือจากฐานข้อมูลนี้เมื่อผู้ใช้ถามหาหนังสือ
+    5. หากผู้ใช้ถามเรื่องหมวดหมู่หนังสือ ให้ตอบตามข้อมูลหมวดหมู่จริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามเดาหรือคาดเดาจำนวนหมวดหมู่เอง
+    6. ห้ามใช้สัญลักษณ์ Markdown เด็ดขาด (ห้ามใช้ **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, ``` โค้ด) เพราะแอป LINE ไม่รองรับการแสดงผล Markdown จะเห็นเป็นสัญลักษณ์ดิบๆ ให้เขียนเป็นข้อความธรรมดาล้วนๆ แทน
+    7. ถ้าต้องการขึ้นหัวข้อย่อยหรือรายการ ให้ใช้เครื่องหมาย "- " หรือตัวเลข "1. 2. 3." นำหน้าบรรทัดแบบข้อความธรรมดา ไม่ใช้สัญลักษณ์ Markdown อื่น
+    8. เว้นบรรทัดว่างระหว่างย่อหน้าหรือหัวข้อเพื่อให้อ่านง่ายบนมือถือ แต่ไม่เว้นบรรทัดถี่เกินไป
 
     [ฐานข้อมูลหนังสือ หอสมุดกลาง มรส.]
     {books_context}
+
+    [ข้อมูลหมวดหมู่หนังสือจริงในระบบ ณ ปัจจุบัน]
+    {category_summary}
 
     [ข้อมูลบริการหอสมุดกลาง มรส.]
     - ที่ตั้ง: อาคารหอสมุดและศูนย์สารสนเทศเฉลิมพระเกียรติ มรส.
@@ -195,13 +300,14 @@ def handle_message(event):
     {user_msg}
     """
 
-    try:
-        response = model.generate_content(prompt)
-        ai_reply = response.text.strip()
-    except Exception as e:
-        print("\n❌ Gemini Error Details:")
-        traceback.print_exc()
-        ai_reply = "ขออภัยค่ะ/ครับ เกิดข้อผิดพลาดในการประมวลผลคำตอบชั่วคราว โปรดลองอีกครั้ง"
+    ai_reply = call_gemini_with_retry(prompt)
+    if ai_reply is None:
+        ai_reply = (
+            "ขออภัยค่ะ/ครับ ขณะนี้มีผู้ใช้งานพร้อมกันจำนวนมาก "
+            "ระบบประมวลผลไม่ทัน กรุณารอสักครู่แล้วลองพิมพ์ใหม่อีกครั้งนะคะ 🙏"
+        )
+    else:
+        ai_reply = clean_markdown(ai_reply)
 
     save_user_interaction(user_id, user_msg, ai_reply)
 
