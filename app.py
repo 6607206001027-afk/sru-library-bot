@@ -76,16 +76,57 @@ def get_books_context(limit=30):
             b = doc.to_dict()
             title = b.get("title", "ไม่ระบุชื่อเรื่อง")
             author = b.get("author", "ไม่ระบุผู้แต่ง")
-            category = b.get("category", "ทั่วไป")
-            summary = b.get("summary", "ไม่มีเรื่องย่อ")
-            books_data.append(
-                f"- ชื่อเรื่อง: {title} | ผู้แต่ง: {author} | หมวดหมู่: {category} | สาระสำคัญ: {summary}"
-            )
+            edition = b.get("edition", "").strip()
+            publisher = b.get("publisher", "ไม่ระบุสำนักพิมพ์")
+            isbn = b.get("isbn", "")
+            call_number = b.get("call_number", "").strip()
+            abstract = b.get("abstract", "") or b.get("content", "")
+
+            # จัดรูปแบบคล้ายบรรณานุกรม APA: ผู้แต่ง. ชื่อเรื่อง (พิมพ์ครั้งที่). สำนักพิมพ์. เลขเรียกหนังสือ.
+            citation = f"{author}. {title}"
+            if edition:
+                citation += f" ({edition})"
+            citation += f". {publisher}."
+            if call_number:
+                citation += f" เลขเรียกหนังสือ: {call_number}."
+            if isbn:
+                citation += f" ISBN: {isbn}."
+            if abstract:
+                citation += f" บทคัดย่อ: {abstract}"
+
+            books_data.append(f"- {citation}")
         return "\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
     except Exception as e:
         print(f"❌ Firestore Read Error: {e}")
         traceback.print_exc()
         return "ไม่มีข้อมูลหนังสือในระบบ"
+
+
+# หมวดหมู่ใหญ่ตามระบบทศนิยมดิวอี้ (DDC) แบ่งตามเลข 3 หลักแรกของเลขเรียกหนังสือ (call_number)
+DDC_MAIN_CLASSES = [
+    (0, 99, "000 - คอมพิวเตอร์ สารสนเทศ และความรู้ทั่วไป"),
+    (100, 199, "100 - ปรัชญาและจิตวิทยา"),
+    (200, 299, "200 - ศาสนา"),
+    (300, 399, "300 - สังคมศาสตร์"),
+    (400, 499, "400 - ภาษา"),
+    (500, 599, "500 - วิทยาศาสตร์"),
+    (600, 699, "600 - เทคโนโลยี"),
+    (700, 799, "700 - ศิลปะและนันทนาการ"),
+    (800, 899, "800 - วรรณกรรม"),
+    (900, 999, "900 - ประวัติศาสตร์และภูมิศาสตร์"),
+]
+
+
+def classify_ddc(call_number):
+    """แปลงเลขเรียกหนังสือ (เช่น '495.9225') ให้เป็นชื่อหมวดดิวอี้ใหญ่ (เช่น '400 - ภาษา')"""
+    try:
+        number = float(str(call_number).strip().split()[0])
+        for low, high, label in DDC_MAIN_CLASSES:
+            if low <= number <= high:
+                return label
+    except (ValueError, IndexError):
+        pass
+    return "ไม่ระบุหมวดหมู่ (ไม่มีเลขเรียกหนังสือ)"
 
 
 def clean_markdown(text):
@@ -123,7 +164,8 @@ def clean_markdown(text):
 
 def get_category_summary():
     """
-    นับหมวดหมู่หนังสือจริงจาก Firestore (ไม่ให้ Gemini เดาเอง)
+    นับหมวดหมู่หนังสือจริงจาก Firestore ตามระบบทศนิยมดิวอี้ (Dewey Decimal Classification)
+    โดยอ่านจาก call_number ของแต่ละเล่ม (ไม่ให้ Gemini เดาเอง)
     คืนค่าเป็นข้อความสรุปจำนวนหมวดหมู่ทั้งหมด พร้อมรายชื่อหมวดหมู่และจำนวนเล่มในแต่ละหมวด
     """
     try:
@@ -132,15 +174,16 @@ def get_category_summary():
         category_counts = {}
         for doc in docs:
             b = doc.to_dict()
-            category = b.get("category", "ไม่ระบุหมวดหมู่")
-            category_counts[category] = category_counts.get(category, 0) + 1
+            call_number = b.get("call_number", "")
+            ddc_label = classify_ddc(call_number)
+            category_counts[ddc_label] = category_counts.get(ddc_label, 0) + 1
 
         if not category_counts:
             return "ยังไม่มีข้อมูลหมวดหมู่หนังสือในระบบ"
 
         total_categories = len(category_counts)
-        lines = [f"ห้องสมุดมีหนังสือทั้งหมด {total_categories} หมวดหมู่ ได้แก่:"]
-        for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+        lines = [f"ห้องสมุดจัดหมวดหมู่ตามระบบทศนิยมดิวอี้ (Dewey Decimal Classification) มีทั้งหมด {total_categories} หมวดที่มีหนังสืออยู่จริง ได้แก่:"]
+        for cat, count in sorted(category_counts.items()):
             lines.append(f"- {cat} ({count} เล่ม)")
         return "\n".join(lines)
     except Exception as e:
@@ -281,10 +324,12 @@ def handle_message(event):
     2. ให้กล่าวทักทาย "สวัสดีค่ะ/ครับ" เฉพาะเมื่อผู้ใช้ทักทายมาก่อนเท่านั้น (เช่น พิมพ์ สวัสดี, หวัดดี, Hello)
     3. หากผู้ใช้ถามข้อมูล ค้นหาหนังสือ หรือสอบถามบริการ ให้ตอบเข้าประเด็นทันที ด้วยคำพูดที่เป็นธรรมชาติ สุภาพ กระชับ เป็นกันเอง ไม่เยิ่นย้อ
     4. อ้างอิงข้อมูลหนังสือจากฐานข้อมูลนี้เมื่อผู้ใช้ถามหาหนังสือ
-    5. หากผู้ใช้ถามเรื่องหมวดหมู่หนังสือ ให้ตอบตามข้อมูลหมวดหมู่จริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามเดาหรือคาดเดาจำนวนหมวดหมู่เอง
+    5. หากผู้ใช้ถามเรื่องหมวดหมู่หนังสือ ให้ตอบตามข้อมูลหมวดหมู่ระบบดิวอี้ (Dewey) จริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามเดาหรือคาดเดาจำนวนหมวดหมู่เอง
     6. ห้ามใช้สัญลักษณ์ Markdown เด็ดขาด (ห้ามใช้ **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, ``` โค้ด) เพราะแอป LINE ไม่รองรับการแสดงผล Markdown จะเห็นเป็นสัญลักษณ์ดิบๆ ให้เขียนเป็นข้อความธรรมดาล้วนๆ แทน
     7. ถ้าต้องการขึ้นหัวข้อย่อยหรือรายการ ให้ใช้เครื่องหมาย "- " หรือตัวเลข "1. 2. 3." นำหน้าบรรทัดแบบข้อความธรรมดา ไม่ใช้สัญลักษณ์ Markdown อื่น
     8. เว้นบรรทัดว่างระหว่างย่อหน้าหรือหัวข้อเพื่อให้อ่านง่ายบนมือถือ แต่ไม่เว้นบรรทัดถี่เกินไป
+    9. เมื่อแนะนำหรือกล่าวถึงหนังสือเล่มใดเล่มหนึ่ง ให้แสดงข้อมูลในรูปแบบคล้ายบรรณานุกรม (เรียงเป็นข้อความต่อเนื่อง ไม่ใช่ตาราง) ประกอบด้วย ผู้แต่ง ชื่อเรื่อง สำนักพิมพ์ เลขเรียกหนังสือ ตามข้อมูลจริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามแต่งข้อมูลที่ไม่มีในฐานข้อมูล
+    10. ถ้าผู้ใช้ถามเรื่องย่อ/บทคัดย่อของหนังสือเล่มใด ให้ตอบจากฟิลด์บทคัดย่อที่ให้ไว้ ถ้าไม่มีข้อมูลในระบบให้บอกตรงๆ ว่ายังไม่มีข้อมูลเรื่องย่อเล่มนี้ ห้ามแต่งเนื้อหาขึ้นเอง
 
     [ฐานข้อมูลหนังสือ หอสมุดกลาง มรส.]
     {books_context}
