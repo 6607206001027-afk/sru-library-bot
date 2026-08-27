@@ -146,8 +146,8 @@ def clean_markdown(text):
     # ลบสัญลักษณ์หัวข้อ Markdown (#, ##, ###)
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
 
-    # แปลงจุดนำหน้าแบบ Markdown (-, *) ให้เป็นจุดไทยที่อ่านง่ายขึ้น
-    text = re.sub(r"^[\*\-]\s+", "• ", text, flags=re.MULTILINE)
+    # แปลงจุดนำหน้าแบบ Markdown (-, *) ให้เป็นจุดไทยที่อ่านง่ายขึ้น (รองรับกรณีมีการเยื้อง/ย่อหน้าด้วย)
+    text = re.sub(r"^[ \t]*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
 
     # ลบดอกจัน/สัญลักษณ์ที่หลงเหลืออยู่เดี่ยวๆ
     text = text.replace("**", "").replace("##", "").replace("###", "")
