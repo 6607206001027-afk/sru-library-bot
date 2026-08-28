@@ -17,8 +17,6 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendM
 # ==========================================
 # 1. ตั้งค่า Keys จาก Environment Variables
 # ==========================================
-# ค่าเหล่านี้ต้องไปตั้งใน Render Dashboard -> Environment
-# ห้ามใส่ค่าจริงลงในไฟล์นี้เด็ดขาด (ไฟล์นี้จะถูก push ขึ้น GitHub)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -39,7 +37,6 @@ if _missing:
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ตั้งค่า Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL_NAME = "gemini-3.5-flash"
 model = genai.GenerativeModel(GEMINI_MODEL_NAME)
@@ -47,8 +44,6 @@ model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 # ==========================================
 # 2. เชื่อมต่อ Firebase
 # ==========================================
-# FIREBASE_CREDENTIALS_JSON คือเนื้อหาทั้งหมดของ serviceAccountKey.json
-# ที่ถูกใส่เป็น environment variable แบบ string เดียว (ไม่ต้องอัปโหลดไฟล์ทุกครั้งเหมือน Colab)
 if not firebase_admin._apps:
     try:
         cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
@@ -77,7 +72,6 @@ def parse_publisher_year(publisher_raw):
     match = re.match(r"^(.*?),?\s*(\d{4})\s*\.?$", publisher_raw.strip())
     if match:
         year = match.group(2)
-        # เช็คว่าเป็นปี พ.ศ. ที่สมเหตุสมผล (2400-2600) กันดึงตัวเลขอื่นที่ไม่ใช่ปีมาผิดๆ
         if 2400 <= int(year) <= 2600:
             publisher_main = match.group(1).strip().rstrip(",")
             return publisher_main, year
@@ -85,10 +79,7 @@ def parse_publisher_year(publisher_raw):
 
 
 def parse_edition(edition_raw):
-    """
-    คืนเลขครั้งที่พิมพ์ เฉพาะกรณีเป็นครั้งที่ 2 ขึ้นไปเท่านั้น
-    (พิมพ์ครั้งที่ 1 ไม่ต้องระบุตามธรรมเนียมการเขียนบรรณานุกรม)
-    """
+    """คืนเลขครั้งที่พิมพ์ เฉพาะกรณีเป็นครั้งที่ 2 ขึ้นไปเท่านั้น"""
     if not edition_raw:
         return None
     match = re.search(r"(\d+)", str(edition_raw))
@@ -99,79 +90,6 @@ def parse_edition(edition_raw):
     return None
 
 
-def extract_year_from_publisher(publisher_text):
-    """
-    ดึงปีที่พิมพ์ออกจากท้าย publisher string ที่เก็บรวมกันแบบ 'สถานที่ : สำนักพิมพ์, ปี'
-    เช่น 'กรุงเทพฯ : แอร์โรว์, 2566' -> คืนค่า ('กรุงเทพฯ : แอร์โรว์', '2566')
-    ถ้าไม่เจอปีท้ายสตริง คืนค่า (publisher_text เดิม, None)
-    """
-    if not publisher_text:
-        return publisher_text, None
-    match = re.search(r"^(.*?),\s*(\d{4})\s*\.?\s*$", publisher_text.strip())
-    if match:
-        publisher_clean = match.group(1).strip()
-        year = match.group(2)
-        return publisher_clean, year
-    return publisher_text.strip(), None
-
-
-def extract_edition_number(edition_text):
-    """
-    ดึงเลขครั้งที่พิมพ์จากข้อความ เช่น 'พิมพ์ครั้งที่ 2.' -> คืนค่า 2 (int)
-    คืนค่า None ถ้าไม่มีตัวเลข หรือไม่มีข้อมูล
-    """
-    if not edition_text:
-        return None
-    match = re.search(r"(\d+)", str(edition_text))
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def get_books_context(limit=30):
-    try:
-        books_ref = db.collection("books").limit(limit)
-        docs = books_ref.stream()
-        books_data = []
-        for doc in docs:
-            b = doc.to_dict()
-            title = b.get("title", "ไม่ระบุชื่อเรื่อง")
-            author = b.get("author", "ไม่ระบุผู้แต่ง")
-            publisher_raw = b.get("publisher", "ไม่ระบุสำนักพิมพ์")
-            publisher, year_from_publisher = parse_publisher_year(publisher_raw)
-            year = b.get("year") or b.get("published_year") or b.get("publish_year") or year_from_publisher
-            edition_num = parse_edition(b.get("edition", ""))
-            isbn = b.get("isbn", "")
-            call_number = b.get("call_number", "").strip()
-            abstract = b.get("abstract", "") or b.get("content", "")
-            ddc_label = classify_ddc(call_number) if call_number else ""
-
-            # จัดรูปแบบเป็นรายการฟิลด์ที่มี label ชัดเจน แสดงเฉพาะฟิลด์ที่มีข้อมูลจริงเท่านั้น
-            entry_lines = [f"ชื่อเรื่อง: {title}", f"ผู้แต่ง: {author}"]
-            if edition_num:
-                entry_lines.append(f"พิมพ์ครั้งที่: {edition_num}")
-            if year:
-                entry_lines.append(f"สำนักพิมพ์: {publisher} (ปีที่พิมพ์: {year})")
-            else:
-                entry_lines.append(f"สำนักพิมพ์: {publisher}")
-            if isbn:
-                entry_lines.append(f"ISBN: {isbn}")
-            if call_number:
-                entry_lines.append(f"เลขเรียกหนังสือ: {call_number}")
-            if ddc_label:
-                entry_lines.append(f"หมวดหมู่ดิวอี้: {ddc_label}")
-            if abstract:
-                entry_lines.append(f"บทคัดย่อ: {abstract}")
-
-            books_data.append("\n".join(entry_lines))
-        return "\n\n---\n\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
-    except Exception as e:
-        print(f"❌ Firestore Read Error: {e}")
-        traceback.print_exc()
-        return "ไม่มีข้อมูลหนังสือในระบบ"
-
-
-# หมวดหมู่ใหญ่ตามระบบทศนิยมดิวอี้ (DDC) แบ่งตามเลข 3 หลักแรกของเลขเรียกหนังสือ (call_number)
 DDC_MAIN_CLASSES = [
     (0, 99, "000 - คอมพิวเตอร์ สารสนเทศ และความรู้ทั่วไป"),
     (100, 199, "100 - ปรัชญาและจิตวิทยา"),
@@ -198,52 +116,72 @@ def classify_ddc(call_number):
     return "ไม่ระบุหมวดหมู่ (ไม่มีเลขเรียกหนังสือ)"
 
 
-def clean_markdown(text):
+def _first(d, keys, default=""):
+    """ลองไล่หาค่าจากหลายชื่อ key เผื่อเอกสารใน Firestore ตั้งชื่อ field ไม่ตรงกันทุกเล่ม"""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", []):
+            return v
+    return default
+
+
+def get_books_context(limit=30):
     """
-    ลบสัญลักษณ์ Markdown ที่ Gemini ชอบใส่มา (LINE ไม่รองรับการแสดงผล Markdown)
-    เช่น **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, - จุดนำหน้า และจัดการเว้นบรรทัดให้อ่านง่ายขึ้น
+    ดึงหนังสือจาก Firestore แล้วจัดรูปแบบให้ครบ 6 ส่วนตามที่ต้องการเสมอ:
+    1. ชื่อเรื่อง 2. ผู้แต่ง 3. สำนักพิมพ์+ปีที่พิมพ์ 4. ISBN 5. เลขเรียกหนังสือ 6. หมวดหมู่ดิวอี้
+    รองรับหลายชื่อ field เผื่อข้อมูลแต่ละเล่มตั้งชื่อ field ไม่ตรงกัน (title/Title, isbn/ISBN ฯลฯ)
     """
-    if not text:
-        return text
+    try:
+        books_ref = db.collection("books").limit(limit)
+        docs = books_ref.stream()
+        books_data = []
+        for doc in docs:
+            b = doc.to_dict()
 
-    # ลบตัวหนา/ตัวเอียงแบบ Markdown: **text**, *text*, __text__, _text_
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
-    text = re.sub(r"__(.+?)__", r"\1", text)
-    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+            title = _first(b, ["title", "Title", "book_name", "BookName"], "ไม่ระบุชื่อเรื่อง")
+            author = _first(b, ["author", "Author", "book_author"], "ไม่ระบุผู้แต่ง")
+            publisher_raw = _first(b, ["publisher", "Publisher", "PublicationName"], "")
+            publisher, year_from_publisher = parse_publisher_year(publisher_raw)
+            year = _first(b, ["year", "published_year", "publish_year"]) or year_from_publisher
+            edition_num = parse_edition(_first(b, ["edition", "Edition"], ""))
+            isbn = _first(b, ["isbn", "ISBN", "Isbn"], "")
+            call_number = str(_first(b, ["call_number", "CallNumber", "callno", "CallNo"], "")).strip()
+            abstract = _first(b, ["abstract", "Abstract", "content", "Description"], "")
+            ddc_label = classify_ddc(call_number) if call_number else ""
 
-    # ลบสัญลักษณ์หัวข้อ Markdown (#, ##, ###)
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+            entry_lines = [f"ชื่อเรื่อง: {title}", f"ผู้แต่ง: {author}"]
+            if edition_num:
+                entry_lines.append(f"พิมพ์ครั้งที่: {edition_num}")
+            if publisher:
+                if year:
+                    entry_lines.append(f"สำนักพิมพ์: {publisher} (ปีที่พิมพ์: {year})")
+                else:
+                    entry_lines.append(f"สำนักพิมพ์: {publisher}")
+            if isbn:
+                entry_lines.append(f"ISBN: {isbn}")
+            if call_number:
+                entry_lines.append(f"เลขเรียกหนังสือ: {call_number}")
+            if ddc_label:
+                entry_lines.append(f"หมวดหมู่ดิวอี้: {ddc_label}")
+            if abstract:
+                entry_lines.append(f"บทคัดย่อ: {abstract}")
 
-    # แปลงจุดนำหน้าแบบ Markdown (-, *) ให้เป็นจุดไทยที่อ่านง่ายขึ้น (รองรับกรณีมีการเยื้อง/ย่อหน้าด้วย)
-    text = re.sub(r"^[ \t]*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
-
-    # ลบดอกจัน/สัญลักษณ์ที่หลงเหลืออยู่เดี่ยวๆ
-    text = text.replace("**", "").replace("##", "").replace("###", "")
-
-    # จัดการบรรทัดว่างซ้ำๆ ให้เหลือแค่ 1 บรรทัดว่างระหว่างย่อหน้า
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    # ลบช่องว่างท้ายบรรทัดที่ไม่จำเป็น
-    lines = [line.rstrip() for line in text.split("\n")]
-    text = "\n".join(lines).strip()
-
-    return text
+            books_data.append("\n".join(entry_lines))
+        return "\n\n---\n\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
+    except Exception as e:
+        print(f"❌ Firestore Read Error: {e}")
+        traceback.print_exc()
+        return "ไม่มีข้อมูลหนังสือในระบบ"
 
 
 def get_category_summary():
-    """
-    นับหมวดหมู่หนังสือจริงจาก Firestore ตามระบบทศนิยมดิวอี้ (Dewey Decimal Classification)
-    โดยอ่านจาก call_number ของแต่ละเล่ม (ไม่ให้ Gemini เดาเอง)
-    คืนค่าเป็นข้อความสรุปจำนวนหมวดหมู่ทั้งหมด พร้อมรายชื่อหมวดหมู่และจำนวนเล่มในแต่ละหมวด
-    """
     try:
         books_ref = db.collection("books")
         docs = books_ref.stream()
         category_counts = {}
         for doc in docs:
             b = doc.to_dict()
-            call_number = b.get("call_number", "")
+            call_number = _first(b, ["call_number", "CallNumber", "callno", "CallNo"], "")
             ddc_label = classify_ddc(call_number)
             category_counts[ddc_label] = category_counts.get(ddc_label, 0) + 1
 
@@ -261,12 +199,41 @@ def get_category_summary():
         return "ไม่สามารถดึงข้อมูลหมวดหมู่ได้ในขณะนี้"
 
 
+def clean_markdown(text):
+    """
+    ลบสัญลักษณ์ Markdown ทั้งหมดแบบเด็ดขาด (LINE ไม่รองรับการแสดงผล Markdown)
+    ขั้นแรกลบแบบมีคู่ (**text**, *text*) ก่อน เพื่อดึงเนื้อความข้างในออกมาให้ครบ
+    จากนั้น "กวาด" ดอกจัน/สัญลักษณ์เดี่ยวๆ ที่หลุดรอดออกมาทั้งหมดทิ้งไปเลย ไม่ว่าจะจับคู่ครบหรือไม่
+    """
+    if not text:
+        return text
+
+    # ลบตัวหนา/ตัวเอียงแบบมีคู่ก่อน เพื่อเก็บเนื้อหาข้างในไว้
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+
+    # ลบสัญลักษณ์หัวข้อ Markdown (#, ##, ###)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+
+    # แปลงจุดนำหน้าแบบ Markdown (-, *) ให้เป็นจุดไทยที่อ่านง่ายขึ้น
+    text = re.sub(r"^[ \t]*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
+
+    # กวาดดอกจัน/สัญลักษณ์ Markdown ที่เหลือค้างทั้งหมดทิ้ง ไม่ว่าจะจับคู่ครบหรือไม่ก็ตาม
+    text = re.sub(r"\*+", "", text)
+    text = text.replace("##", "").replace("###", "")
+
+    # จัดการบรรทัดว่างซ้ำๆ ให้เหลือแค่ 1 บรรทัดว่างระหว่างย่อหน้า
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    lines = [line.rstrip() for line in text.split("\n")]
+    text = "\n".join(lines).strip()
+
+    return text
+
+
 def call_gemini_with_retry(prompt, max_retries=1):
-    """
-    เรียก Gemini API พร้อม retry อัตโนมัติเมื่อโดน rate limit (ResourceExhausted / 429)
-    Google Gemini free tier มีโควต้าจำกัดต่อนาที ถ้าโดน limit จะบอกเวลาที่ต้องรอ (retry_delay)
-    เรารอตามเวลานั้นแล้วลองใหม่อัตโนมัติ 1 ครั้ง ก่อนจะยอมแพ้และคืนค่า None
-    """
     for attempt in range(max_retries + 1):
         try:
             response = model.generate_content(prompt)
@@ -275,7 +242,6 @@ def call_gemini_with_retry(prompt, max_retries=1):
             print(f"\n⚠️ Gemini Rate Limit (attempt {attempt + 1}/{max_retries + 1}):")
             traceback.print_exc()
             if attempt < max_retries:
-                # พยายามอ่านเวลาที่ Google แนะนำให้รอจาก error, ถ้าไม่มีให้รอ default 15 วินาที
                 wait_seconds = 15
                 try:
                     retry_info = getattr(e, "retry_delay", None)
@@ -284,7 +250,7 @@ def call_gemini_with_retry(prompt, max_retries=1):
                 except Exception:
                     pass
                 print(f"⏳ รอ {wait_seconds} วินาทีก่อนลองใหม่...")
-                time.sleep(min(wait_seconds, 45))  # ไม่รอเกิน 45 วิ กัน LINE reply token หมดอายุ
+                time.sleep(min(wait_seconds, 45))
             else:
                 return None
         except Exception as e:
@@ -361,7 +327,6 @@ def create_flex_message(reply_text):
 # ==========================================
 @app.route("/", methods=["GET"])
 def health_check():
-    # Render จะเรียก path นี้เพื่อเช็คว่า service ยังมีชีวิตอยู่
     return "บรรณารักษ์อัจฉริยะ กำลังทำงานอยู่ ✅", 200
 
 
@@ -389,25 +354,25 @@ def handle_message(event):
     ให้บริการแก่นักศึกษา อาจารย์ บุคลากร และบุคคลภายนอก
 
     กฎสำคัญในการตอบคำถาม:
-    1. ห้ามกล่าวทักทายยาวๆ ซ้ำซ้อน เช่น "สวัสดีค่ะ ยินดีต้อนรับสู่หอสมุดกลาง..." ในทุกๆ คำตอบ
-    2. ให้กล่าวทักทาย "สวัสดีค่ะ/ครับ" เฉพาะเมื่อผู้ใช้ทักทายมาก่อนเท่านั้น (เช่น พิมพ์ สวัสดี, หวัดดี, Hello)
-    3. หากผู้ใช้ถามข้อมูล ค้นหาหนังสือ หรือสอบถามบริการ ให้ตอบเข้าประเด็นทันที ด้วยคำพูดที่เป็นธรรมชาติ สุภาพ กระชับ เป็นกันเอง ไม่เยิ่นย้อ
+    1. ห้ามกล่าวทักทายยาวๆ ซ้ำซ้อนในทุกๆ คำตอบ
+    2. ให้กล่าวทักทาย "สวัสดีค่ะ/ครับ" เฉพาะเมื่อผู้ใช้ทักทายมาก่อนเท่านั้น
+    3. ตอบเข้าประเด็นทันที ด้วยคำพูดที่เป็นธรรมชาติ สุภาพ กระชับ เป็นกันเอง ไม่เยิ่นย้อ
     4. อ้างอิงข้อมูลหนังสือจากฐานข้อมูลนี้เมื่อผู้ใช้ถามหาหนังสือ
-    5. หากผู้ใช้ถามเรื่องหมวดหมู่หนังสือ ให้ตอบตามข้อมูลหมวดหมู่ระบบดิวอี้ (Dewey) จริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามเดาหรือคาดเดาจำนวนหมวดหมู่เอง
-    6. ห้ามใช้สัญลักษณ์ Markdown เด็ดขาด (ห้ามใช้ **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, ``` โค้ด) เพราะแอป LINE ไม่รองรับการแสดงผล Markdown จะเห็นเป็นสัญลักษณ์ดิบๆ ให้เขียนเป็นข้อความธรรมดาล้วนๆ แทน
-    7. ถ้าต้องการขึ้นหัวข้อย่อยหรือรายการ ให้ใช้เครื่องหมาย "- " หรือตัวเลข "1. 2. 3." นำหน้าบรรทัดแบบข้อความธรรมดา ไม่ใช้สัญลักษณ์ Markdown อื่น
-    8. เว้นบรรทัดว่างระหว่างย่อหน้าหรือหัวข้อเพื่อให้อ่านง่ายบนมือถือ แต่ไม่เว้นบรรทัดถี่เกินไป
-    9. เมื่อแนะนำหรือกล่าวถึงหนังสือเล่มใดเล่มหนึ่ง ให้แสดงข้อมูลแยกเป็นรายบรรทัดตามลำดับนี้เท่านั้น โดยใช้ label ตามนี้เป๊ะๆ (ไม่ต้องใส่เลขข้อหรือสัญลักษณ์นำหน้า):
+    5. เรื่องหมวดหมู่หนังสือ ให้ตอบตามข้อมูลหมวดหมู่ระบบดิวอี้จริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามเดา
+    6. ห้ามใช้สัญลักษณ์ Markdown เด็ดขาด (ห้ามใช้ **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, ``` โค้ด) เพราะ LINE ไม่รองรับ ให้เขียนเป็นข้อความธรรมดาล้วนๆ แทน แม้จะเน้นคำสำคัญก็ห้ามใส่ * ล้อมรอบเด็ดขาด
+    7. ถ้าต้องการขึ้นหัวข้อย่อย ให้ใช้ "- " หรือ "1. 2. 3." แบบข้อความธรรมดา
+    8. เว้นบรรทัดว่างระหว่างย่อหน้าพอประมาณ ไม่ถี่เกินไป
+    9. เมื่อแนะนำหนังสือเล่มใดเล่มหนึ่ง ให้แสดงข้อมูล "ทุกฟิลด์ที่มีข้อมูลอยู่จริงในฐานข้อมูลด้านล่าง" แยกรายบรรทัดตามลำดับนี้เป๊ะๆ (ห้ามข้ามฟิลด์ที่มีข้อมูลอยู่จริง และห้ามใส่เลขข้อ/สัญลักษณ์นำหน้า):
        ชื่อเรื่อง: [ชื่อหนังสือ]
        ผู้แต่ง: [ชื่อผู้แต่ง]
-       พิมพ์ครั้งที่: [เลขครั้งที่พิมพ์ ถ้ามีข้อมูลและเป็นครั้งที่ 2 ขึ้นไปเท่านั้น]
+       พิมพ์ครั้งที่: [เลขครั้งที่พิมพ์ เฉพาะกรณีมีข้อมูลและเป็นครั้งที่ 2 ขึ้นไป]
        สำนักพิมพ์: [ชื่อสำนักพิมพ์] (ปีที่พิมพ์: [ปี ถ้ามีข้อมูล])
        ISBN: [เลข ISBN ถ้ามีข้อมูล]
        เลขเรียกหนังสือ: [เลขเรียก ถ้ามีข้อมูล]
        หมวดหมู่ดิวอี้: [หมวดดิวอี้ ถ้ามีข้อมูล]
-       ข้อมูลแต่ละส่วนต้องมาจากฐานข้อมูลด้านล่างเท่านั้น ห้ามแต่งขึ้นเอง ถ้าเล่มใดไม่มีข้อมูลฟิลด์ไหน ให้ข้ามบรรทัดนั้นไปเลย ไม่ต้องเขียนว่า "ไม่ระบุ" หรือเดาใส่
+       ข้อมูลแต่ละส่วนต้องมาจากฐานข้อมูลด้านล่างเท่านั้น ห้ามแต่งขึ้นเอง ถ้าฟิลด์ไหนไม่มีข้อมูลจริงๆ ให้ข้ามบรรทัดนั้นไปเลย ไม่ต้องเขียนว่า "ไม่ระบุ"
        ถ้าแนะนำหลายเล่ม ให้เว้นบรรทัดว่าง 1 บรรทัดคั่นระหว่างแต่ละเล่ม
-    10. ถ้าผู้ใช้ถามเรื่องย่อ/บทคัดย่อของหนังสือเล่มใด ให้ตอบจากฟิลด์บทคัดย่อที่ให้ไว้ ถ้าไม่มีข้อมูลในระบบให้บอกตรงๆ ว่ายังไม่มีข้อมูลเรื่องย่อเล่มนี้ ห้ามแต่งเนื้อหาขึ้นเอง
+    10. ถ้าถามเรื่องย่อ/บทคัดย่อ ให้ตอบจากฟิลด์บทคัดย่อที่ให้ไว้ ถ้าไม่มีข้อมูลให้บอกตรงๆ ห้ามแต่งเนื้อหาขึ้นเอง
 
     [ฐานข้อมูลหนังสือ หอสมุดกลาง มรส.]
     {books_context}
@@ -448,7 +413,7 @@ def handle_message(event):
 
 
 # ==========================================
-# 5. Local dev entrypoint (Render ใช้ gunicorn แทน ไม่ใช้ส่วนนี้)
+# 5. Local dev entrypoint
 # ==========================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
