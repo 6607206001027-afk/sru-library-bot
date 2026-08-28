@@ -67,6 +67,67 @@ app = Flask(__name__)
 # ==========================================
 # 3. Helper Functions
 # ==========================================
+def parse_publisher_year(publisher_raw):
+    """
+    แยกปีที่พิมพ์ (พ.ศ. 4 หลัก) ที่มักซ่อนอยู่ท้าย field publisher ออกมา
+    เช่น 'กรุงเทพฯ : แอร์โรว์, 2566' -> ('กรุงเทพฯ : แอร์โรว์', '2566')
+    """
+    if not publisher_raw:
+        return publisher_raw, None
+    match = re.match(r"^(.*?),?\s*(\d{4})\s*\.?$", publisher_raw.strip())
+    if match:
+        year = match.group(2)
+        # เช็คว่าเป็นปี พ.ศ. ที่สมเหตุสมผล (2400-2600) กันดึงตัวเลขอื่นที่ไม่ใช่ปีมาผิดๆ
+        if 2400 <= int(year) <= 2600:
+            publisher_main = match.group(1).strip().rstrip(",")
+            return publisher_main, year
+    return publisher_raw.strip(), None
+
+
+def parse_edition(edition_raw):
+    """
+    คืนเลขครั้งที่พิมพ์ เฉพาะกรณีเป็นครั้งที่ 2 ขึ้นไปเท่านั้น
+    (พิมพ์ครั้งที่ 1 ไม่ต้องระบุตามธรรมเนียมการเขียนบรรณานุกรม)
+    """
+    if not edition_raw:
+        return None
+    match = re.search(r"(\d+)", str(edition_raw))
+    if match:
+        num = int(match.group(1))
+        if num >= 2:
+            return num
+    return None
+
+
+def extract_year_from_publisher(publisher_text):
+    """
+    ดึงปีที่พิมพ์ออกจากท้าย publisher string ที่เก็บรวมกันแบบ 'สถานที่ : สำนักพิมพ์, ปี'
+    เช่น 'กรุงเทพฯ : แอร์โรว์, 2566' -> คืนค่า ('กรุงเทพฯ : แอร์โรว์', '2566')
+    ถ้าไม่เจอปีท้ายสตริง คืนค่า (publisher_text เดิม, None)
+    """
+    if not publisher_text:
+        return publisher_text, None
+    match = re.search(r"^(.*?),\s*(\d{4})\s*\.?\s*$", publisher_text.strip())
+    if match:
+        publisher_clean = match.group(1).strip()
+        year = match.group(2)
+        return publisher_clean, year
+    return publisher_text.strip(), None
+
+
+def extract_edition_number(edition_text):
+    """
+    ดึงเลขครั้งที่พิมพ์จากข้อความ เช่น 'พิมพ์ครั้งที่ 2.' -> คืนค่า 2 (int)
+    คืนค่า None ถ้าไม่มีตัวเลข หรือไม่มีข้อมูล
+    """
+    if not edition_text:
+        return None
+    match = re.search(r"(\d+)", str(edition_text))
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def get_books_context(limit=30):
     try:
         books_ref = db.collection("books").limit(limit)
@@ -76,26 +137,34 @@ def get_books_context(limit=30):
             b = doc.to_dict()
             title = b.get("title", "ไม่ระบุชื่อเรื่อง")
             author = b.get("author", "ไม่ระบุผู้แต่ง")
-            edition = b.get("edition", "").strip()
-            publisher = b.get("publisher", "ไม่ระบุสำนักพิมพ์")
+            publisher_raw = b.get("publisher", "ไม่ระบุสำนักพิมพ์")
+            publisher, year_from_publisher = parse_publisher_year(publisher_raw)
+            year = b.get("year") or b.get("published_year") or b.get("publish_year") or year_from_publisher
+            edition_num = parse_edition(b.get("edition", ""))
             isbn = b.get("isbn", "")
             call_number = b.get("call_number", "").strip()
             abstract = b.get("abstract", "") or b.get("content", "")
+            ddc_label = classify_ddc(call_number) if call_number else ""
 
-            # จัดรูปแบบคล้ายบรรณานุกรม APA: ผู้แต่ง. ชื่อเรื่อง (พิมพ์ครั้งที่). สำนักพิมพ์. เลขเรียกหนังสือ.
-            citation = f"{author}. {title}"
-            if edition:
-                citation += f" ({edition})"
-            citation += f". {publisher}."
-            if call_number:
-                citation += f" เลขเรียกหนังสือ: {call_number}."
+            # จัดรูปแบบเป็นรายการฟิลด์ที่มี label ชัดเจน แสดงเฉพาะฟิลด์ที่มีข้อมูลจริงเท่านั้น
+            entry_lines = [f"ชื่อเรื่อง: {title}", f"ผู้แต่ง: {author}"]
+            if edition_num:
+                entry_lines.append(f"พิมพ์ครั้งที่: {edition_num}")
+            if year:
+                entry_lines.append(f"สำนักพิมพ์: {publisher} (ปีที่พิมพ์: {year})")
+            else:
+                entry_lines.append(f"สำนักพิมพ์: {publisher}")
             if isbn:
-                citation += f" ISBN: {isbn}."
+                entry_lines.append(f"ISBN: {isbn}")
+            if call_number:
+                entry_lines.append(f"เลขเรียกหนังสือ: {call_number}")
+            if ddc_label:
+                entry_lines.append(f"หมวดหมู่ดิวอี้: {ddc_label}")
             if abstract:
-                citation += f" บทคัดย่อ: {abstract}"
+                entry_lines.append(f"บทคัดย่อ: {abstract}")
 
-            books_data.append(f"- {citation}")
-        return "\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
+            books_data.append("\n".join(entry_lines))
+        return "\n\n---\n\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
     except Exception as e:
         print(f"❌ Firestore Read Error: {e}")
         traceback.print_exc()
@@ -328,7 +397,16 @@ def handle_message(event):
     6. ห้ามใช้สัญลักษณ์ Markdown เด็ดขาด (ห้ามใช้ **ตัวหนา**, *ตัวเอียง*, # หัวข้อ, ``` โค้ด) เพราะแอป LINE ไม่รองรับการแสดงผล Markdown จะเห็นเป็นสัญลักษณ์ดิบๆ ให้เขียนเป็นข้อความธรรมดาล้วนๆ แทน
     7. ถ้าต้องการขึ้นหัวข้อย่อยหรือรายการ ให้ใช้เครื่องหมาย "- " หรือตัวเลข "1. 2. 3." นำหน้าบรรทัดแบบข้อความธรรมดา ไม่ใช้สัญลักษณ์ Markdown อื่น
     8. เว้นบรรทัดว่างระหว่างย่อหน้าหรือหัวข้อเพื่อให้อ่านง่ายบนมือถือ แต่ไม่เว้นบรรทัดถี่เกินไป
-    9. เมื่อแนะนำหรือกล่าวถึงหนังสือเล่มใดเล่มหนึ่ง ให้แสดงข้อมูลในรูปแบบคล้ายบรรณานุกรม (เรียงเป็นข้อความต่อเนื่อง ไม่ใช่ตาราง) ประกอบด้วย ผู้แต่ง ชื่อเรื่อง สำนักพิมพ์ เลขเรียกหนังสือ ตามข้อมูลจริงที่ให้ไว้ด้านล่างเท่านั้น ห้ามแต่งข้อมูลที่ไม่มีในฐานข้อมูล
+    9. เมื่อแนะนำหรือกล่าวถึงหนังสือเล่มใดเล่มหนึ่ง ให้แสดงข้อมูลแยกเป็นรายบรรทัดตามลำดับนี้เท่านั้น โดยใช้ label ตามนี้เป๊ะๆ (ไม่ต้องใส่เลขข้อหรือสัญลักษณ์นำหน้า):
+       ชื่อเรื่อง: [ชื่อหนังสือ]
+       ผู้แต่ง: [ชื่อผู้แต่ง]
+       พิมพ์ครั้งที่: [เลขครั้งที่พิมพ์ ถ้ามีข้อมูลและเป็นครั้งที่ 2 ขึ้นไปเท่านั้น]
+       สำนักพิมพ์: [ชื่อสำนักพิมพ์] (ปีที่พิมพ์: [ปี ถ้ามีข้อมูล])
+       ISBN: [เลข ISBN ถ้ามีข้อมูล]
+       เลขเรียกหนังสือ: [เลขเรียก ถ้ามีข้อมูล]
+       หมวดหมู่ดิวอี้: [หมวดดิวอี้ ถ้ามีข้อมูล]
+       ข้อมูลแต่ละส่วนต้องมาจากฐานข้อมูลด้านล่างเท่านั้น ห้ามแต่งขึ้นเอง ถ้าเล่มใดไม่มีข้อมูลฟิลด์ไหน ให้ข้ามบรรทัดนั้นไปเลย ไม่ต้องเขียนว่า "ไม่ระบุ" หรือเดาใส่
+       ถ้าแนะนำหลายเล่ม ให้เว้นบรรทัดว่าง 1 บรรทัดคั่นระหว่างแต่ละเล่ม
     10. ถ้าผู้ใช้ถามเรื่องย่อ/บทคัดย่อของหนังสือเล่มใด ให้ตอบจากฟิลด์บทคัดย่อที่ให้ไว้ ถ้าไม่มีข้อมูลในระบบให้บอกตรงๆ ว่ายังไม่มีข้อมูลเรื่องย่อเล่มนี้ ห้ามแต่งเนื้อหาขึ้นเอง
 
     [ฐานข้อมูลหนังสือ หอสมุดกลาง มรส.]
