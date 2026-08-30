@@ -125,7 +125,7 @@ def _first(d, keys, default=""):
     return default
 
 
-def get_books_context(limit=30):
+def get_books_context(limit=15):
     """
     ดึงหนังสือจาก Firestore แล้วจัดรูปแบบให้ครบ 6 ส่วนตามที่ต้องการเสมอ:
     1. ชื่อเรื่อง 2. ผู้แต่ง 3. สำนักพิมพ์+ปีที่พิมพ์ 4. ISBN 5. เลขเรียกหนังสือ 6. หมวดหมู่ดิวอี้
