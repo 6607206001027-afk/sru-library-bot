@@ -125,61 +125,133 @@ def _first(d, keys, default=""):
     return default
 
 
-def get_books_context(limit=15):
+def _tokenize(text):
     """
-    ดึงหนังสือจาก Firestore แล้วจัดรูปแบบให้ครบ 6 ส่วนตามที่ต้องการเสมอ:
-    1. ชื่อเรื่อง 2. ผู้แต่ง 3. สำนักพิมพ์+ปีที่พิมพ์ 4. ISBN 5. เลขเรียกหนังสือ 6. หมวดหมู่ดิวอี้
-    รองรับหลายชื่อ field เผื่อข้อมูลแต่ละเล่มตั้งชื่อ field ไม่ตรงกัน (title/Title, isbn/ISBN ฯลฯ)
+    ตัดข้อความเป็นชุดคำ (set) สำหรับเทียบหาความเกี่ยวข้อง รองรับทั้งไทยและอังกฤษ/ตัวเลข
+    ใช้ regex จับกลุ่มตัวอักษรไทย+อังกฤษ+ตัวเลขติดกัน แล้วแปลงเป็นตัวพิมพ์เล็กทั้งหมด
+    """
+    if not text:
+        return set()
+    return set(re.findall(r"[a-zA-Z0-9\u0E00-\u0E7F]+", str(text).lower()))
+
+
+# คำทั่วไปที่ไม่ควรเอามาช่วยกรองหนังสือ (พบบ่อยในทุกประโยคแต่ไม่ได้บ่งบอกเนื้อหาหนังสือ)
+_STOPWORDS = {
+    "หนังสือ", "แนะนำ", "มี", "ไหม", "ไหน", "หา", "ค้น", "ขอ", "อยาก", "อ่าน",
+    "ครับ", "ค่ะ", "คะ", "หน่อย", "บ้าง", "เกี่ยวกับ", "เรื่อง", "เล่ม", "ที่",
+    "จะ", "ให้", "ได้", "และ", "หรือ", "ใน", "ของ", "กับ", "ยืม", "สนใจ",
+}
+
+
+def fetch_all_books():
+    """
+    ดึงหนังสือทั้งหมดจาก Firestore เพียงครั้งเดียวต่อข้อความ แล้วส่งต่อให้ทั้งฟังก์ชันค้นหา
+    และฟังก์ชันนับหมวดหมู่ใช้ข้อมูลชุดเดียวกัน (เดิมแต่ละฟังก์ชันอ่าน Firestore แยกกันคนละรอบ
+    ทำให้ช้าโดยไม่จำเป็น) ไม่ใส่ limit เพื่อให้การนับหมวดหมู่ยังแม่นยำเท่าของเดิมทุกประการ
     """
     try:
-        books_ref = db.collection("books").limit(limit)
-        docs = books_ref.stream()
-        books_data = []
-        for doc in docs:
-            b = doc.to_dict()
-
-            title = _first(b, ["title", "Title", "book_name", "BookName"], "ไม่ระบุชื่อเรื่อง")
-            author = _first(b, ["author", "Author", "book_author"], "ไม่ระบุผู้แต่ง")
-            publisher_raw = _first(b, ["publisher", "Publisher", "PublicationName"], "")
-            publisher, year_from_publisher = parse_publisher_year(publisher_raw)
-            year = _first(b, ["year", "published_year", "publish_year"]) or year_from_publisher
-            edition_num = parse_edition(_first(b, ["edition", "Edition"], ""))
-            isbn = _first(b, ["isbn", "ISBN", "Isbn"], "")
-            call_number = str(_first(b, ["call_number", "CallNumber", "callno", "CallNo"], "")).strip()
-            abstract = _first(b, ["abstract", "Abstract", "content", "Description"], "")
-            ddc_label = classify_ddc(call_number) if call_number else ""
-
-            entry_lines = [f"ชื่อเรื่อง: {title}", f"ผู้แต่ง: {author}"]
-            if edition_num:
-                entry_lines.append(f"พิมพ์ครั้งที่: {edition_num}")
-            if publisher:
-                if year:
-                    entry_lines.append(f"สำนักพิมพ์: {publisher} (ปีที่พิมพ์: {year})")
-                else:
-                    entry_lines.append(f"สำนักพิมพ์: {publisher}")
-            if isbn:
-                entry_lines.append(f"ISBN: {isbn}")
-            if call_number:
-                entry_lines.append(f"เลขเรียกหนังสือ: {call_number}")
-            if ddc_label:
-                entry_lines.append(f"หมวดหมู่ดิวอี้: {ddc_label}")
-            if abstract:
-                entry_lines.append(f"บทคัดย่อ: {abstract}")
-
-            books_data.append("\n".join(entry_lines))
-        return "\n\n---\n\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
+        return list(db.collection("books").stream())
     except Exception as e:
         print(f"❌ Firestore Read Error: {e}")
         traceback.print_exc()
-        return "ไม่มีข้อมูลหนังสือในระบบ"
+        return []
 
 
-def get_category_summary():
+def get_books_context(all_docs, user_msg="", max_results=15):
+    """
+    ค้นหาหนังสือที่เกี่ยวข้องกับคำถามของผู้ใช้จริง แทนการหยิบเล่มแรกๆ ในฐานข้อมูลแบบสุ่ม
+    รับ all_docs ที่ดึงมาแล้วจาก fetch_all_books() เพื่อไม่ต้องอ่าน Firestore ซ้ำ
+    วิธีทำงาน:
+    1. ตัดคำในข้อความผู้ใช้ (ตัดคำ stopword ทั่วไปออก) แล้วให้คะแนนหนังสือแต่ละเล่ม
+       ตามว่ามีคำนั้นอยู่ใน ชื่อเรื่อง (คะแนนสูงสุด) / ผู้แต่ง+คำสำคัญ+บทคัดย่อ (คะแนนรอง) หรือไม่
+    2. เรียงตามคะแนนมากไปน้อย เลือกเฉพาะเล่มที่มีคะแนน > 0 มาส่งให้ Gemini
+    3. ถ้าผู้ใช้ไม่ได้พิมพ์คำค้นที่เจาะจง (เช่น "แนะนำหนังสือหน่อย" เฉยๆ) จะไม่มีคำให้กรอง
+       กรณีนี้จะหยิบตัวอย่างเล่มแรกๆ มาให้แนะนำทั่วไปแทน (ไม่ใช่การค้นหาที่ล้มเหลว)
+    คืนค่า: (books_text, search_attempted)
+      - search_attempted = True หมายถึงผู้ใช้พิมพ์คำค้นเจาะจงแล้วแต่ไม่เจอเล่มที่ตรงเลย
+    """
+    if not all_docs:
+        return "ไม่มีข้อมูลหนังสือในระบบ", False
+
+    query_tokens = _tokenize(user_msg) - _STOPWORDS
+    search_attempted = bool(query_tokens)
+
+    if search_attempted:
+        scored = []
+        for doc in all_docs:
+            b = doc.to_dict()
+            title_tokens = _tokenize(_first(b, ["title", "Title", "book_name", "BookName"], ""))
+            other_text = " ".join(str(_first(b, k, "")) for k in [
+                ["author", "Author", "book_author"],
+                ["keywords", "Keyword", "subject", "Subject"],
+                ["abstract", "Abstract", "content", "Description"],
+            ])
+            other_tokens = _tokenize(other_text)
+
+            score = 0
+            for t in query_tokens:
+                if t in title_tokens:
+                    score += 3
+                elif t in other_tokens:
+                    score += 1
+                else:
+                    # เช็คคำที่เป็นส่วนหนึ่งของกันและกัน เผื่อพิมพ์คำค้นสั้น/ยาวกว่าคำในฐานข้อมูลเล็กน้อย
+                    if any(len(t) >= 3 and (t in w or w in t) for w in title_tokens):
+                        score += 2
+            if score > 0:
+                scored.append((score, doc))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        selected_docs = [d for _, d in scored[:max_results]]
+
+        if not selected_docs:
+            return "ไม่พบหนังสือที่ตรงกับคำค้นนี้ในฐานข้อมูล", True
+    else:
+        # ไม่มีคำค้นเจาะจง (เช่น ทักทายทั่วไป หรือขอคำแนะนำแบบกว้างๆ) — ใช้ตัวอย่างเล่มแรกๆ
+        selected_docs = all_docs[:max_results]
+
+    books_data = []
+    for doc in selected_docs:
+        b = doc.to_dict()
+
+        title = _first(b, ["title", "Title", "book_name", "BookName"], "ไม่ระบุชื่อเรื่อง")
+        author = _first(b, ["author", "Author", "book_author"], "ไม่ระบุผู้แต่ง")
+        publisher_raw = _first(b, ["publisher", "Publisher", "PublicationName"], "")
+        publisher, year_from_publisher = parse_publisher_year(publisher_raw)
+        year = _first(b, ["year", "published_year", "publish_year"]) or year_from_publisher
+        edition_num = parse_edition(_first(b, ["edition", "Edition"], ""))
+        isbn = _first(b, ["isbn", "ISBN", "Isbn"], "")
+        call_number = str(_first(b, ["call_number", "CallNumber", "callno", "CallNo"], "")).strip()
+        abstract = _first(b, ["abstract", "Abstract", "content", "Description"], "")
+        ddc_label = classify_ddc(call_number) if call_number else ""
+
+        entry_lines = [f"ชื่อเรื่อง: {title}", f"ผู้แต่ง: {author}"]
+        if edition_num:
+            entry_lines.append(f"พิมพ์ครั้งที่: {edition_num}")
+        if publisher:
+            if year:
+                entry_lines.append(f"สำนักพิมพ์: {publisher} (ปีที่พิมพ์: {year})")
+            else:
+                entry_lines.append(f"สำนักพิมพ์: {publisher}")
+        if isbn:
+            entry_lines.append(f"ISBN: {isbn}")
+        if call_number:
+            entry_lines.append(f"เลขเรียกหนังสือ: {call_number}")
+        if ddc_label:
+            entry_lines.append(f"หมวดหมู่ดิวอี้: {ddc_label}")
+        if abstract:
+            entry_lines.append(f"บทคัดย่อ: {abstract}")
+
+        books_data.append("\n".join(entry_lines))
+
+    result_text = "\n\n---\n\n".join(books_data) if books_data else "ไม่มีข้อมูลหนังสือในระบบ"
+    return result_text, search_attempted
+
+
+def get_category_summary(all_docs):
     try:
-        books_ref = db.collection("books")
-        docs = books_ref.stream()
         category_counts = {}
-        for doc in docs:
+        for doc in all_docs:
             b = doc.to_dict()
             call_number = _first(b, ["call_number", "CallNumber", "callno", "CallNo"], "")
             ddc_label = classify_ddc(call_number)
@@ -346,8 +418,9 @@ def handle_message(event):
     user_id = event.source.user_id
     user_msg = event.message.text.strip()
 
-    books_context = get_books_context()
-    category_summary = get_category_summary()
+    all_docs = fetch_all_books()
+    books_context, search_attempted = get_books_context(all_docs, user_msg)
+    category_summary = get_category_summary(all_docs)
 
     prompt = f"""
     คุณคือ 'บรรณารักษ์อัจฉริยะ' ประจำหอสมุดกลาง มหาวิทยาลัยราชภัฏสุราษฎร์ธานี (SRU Library)
@@ -376,8 +449,9 @@ def handle_message(event):
     10. ถ้าถามเรื่องย่อ/บทคัดย่อ ให้ตอบจากฟิลด์บทคัดย่อที่ให้ไว้ ถ้าไม่มีข้อมูลให้บอกตรงๆ ห้ามแต่งเนื้อหาขึ้นเอง
     11. ถ้าผู้ใช้ถามเรื่องสิทธิ์การยืม/ระยะเวลายืม/จำนวนที่ยืมได้ ให้ตอบตาม [ข้อมูลสิทธิ์การยืมทรัพยากรสารสนเทศ] ด้านล่างเท่านั้น ห้ามเดาหรือแต่งตัวเลขขึ้นเอง ถ้าผู้ใช้ถามถึงกลุ่ม "บุคคลภายนอก" ให้ตอบตรงๆ ว่าเว็บไซต์ห้องสมุดไม่ได้ระบุสิทธิ์การยืมของบุคคลภายนอกไว้ชัดเจน และแนะนำให้ติดต่อเจ้าหน้าที่หอสมุดโดยตรงตามเบอร์ที่ให้ไว้เพื่อสอบถามเงื่อนไข ห้ามสรุปเองว่าบุคคลภายนอกยืมได้หรือไม่ได้
     12. เมื่อตอบเรื่องสิทธิ์การยืม ให้ใช้อิโมจิ 🎓 นำหน้าแต่ละกลุ่มผู้ใช้ และจัดรูปแบบเป็นบรรทัดสั้นๆ อ่านง่ายบนมือถือ ไม่ต้องทำเป็นตารางเพราะ LINE แสดงตารางไม่ได้
+    13. หนังสือใน [ผลการค้นหาหนังสือที่เกี่ยวข้องกับคำถาม] ด้านล่างนี้ ถูกกรองมาจากคำที่ผู้ใช้พิมพ์ถามแล้ว ไม่ใช่ตัวอย่างสุ่มจากทั้งระบบ ถ้าข้อความด้านล่างระบุว่า "ไม่พบหนังสือที่ตรงกับคำค้นนี้ในฐานข้อมูล" ให้บอกตรงๆ ตามนั้นว่าไม่พบในระบบ ห้ามหยิบหนังสือเล่มอื่นที่ไม่เกี่ยวข้องมาแนะนำแทนโดยไม่บอกผู้ใช้ว่าไม่ตรงกับที่ถาม
 
-    [ฐานข้อมูลหนังสือ หอสมุดกลาง มรส.]
+    [ผลการค้นหาหนังสือที่เกี่ยวข้องกับคำถาม]
     {books_context}
 
     [ข้อมูลหมวดหมู่หนังสือจริงในระบบ ณ ปัจจุบัน]
