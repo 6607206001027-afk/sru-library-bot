@@ -156,17 +156,24 @@ _FILLER_PHRASES = [
 MENU_RANDOM_RECOMMEND_TEXTS = {
     "แนะนำหนังสือน่าอ่าน",
 }
+# เทียบแบบ normalize ทั้งสองฝั่งด้วยฟังก์ชันเดียวกัน กันกรณีวลีอ้างอิงเองมีช่องว่างแฝงอยู่ด้วย
+_MENU_RANDOM_RECOMMEND_NORMALIZED = set()  # เติมค่าไว้ด้านล่างหลังนิยาม _normalize_menu_text
 
 
 def _normalize_menu_text(text):
     """
-    ล้างอักขระที่มองไม่เห็น (zero-width space, BOM ฯลฯ) และช่องว่างหัวท้ายออกจากข้อความ
+    ล้างอักขระที่มองไม่เห็น (zero-width space, BOM ฯลฯ) และช่องว่างทุกชนิดออกจากข้อความทั้งหมด
+    (ไม่ใช่แค่หัวท้าย เผื่อปุ่มเมนูแอบมีช่องว่างหรือ newline แทรกอยู่ตรงกลาง)
     ใช้เทียบกับปุ่มเมนูเท่านั้น เพื่อกันปัญหาปุ่มเมนูส่งอักขระแฝงมาปนแล้วเทียบไม่ตรง
     """
     if not text:
         return ""
     cleaned = re.sub(r"[\u200b-\u200f\ufeff]", "", str(text))
-    return cleaned.strip()
+    cleaned = re.sub(r"\s+", "", cleaned)
+    return cleaned
+
+
+_MENU_RANDOM_RECOMMEND_NORMALIZED = {_normalize_menu_text(t) for t in MENU_RANDOM_RECOMMEND_TEXTS}
 
 
 def _extract_search_terms(user_msg):
@@ -219,10 +226,19 @@ def get_books_context(all_docs, user_msg="", max_results=15, random_pick_count=5
     if not all_docs:
         return "ไม่มีข้อมูลหนังสือในระบบ", False
 
-    if _normalize_menu_text(user_msg) in MENU_RANDOM_RECOMMEND_TEXTS:
+    normalized_msg = _normalize_menu_text(user_msg)
+    if normalized_msg in _MENU_RANDOM_RECOMMEND_NORMALIZED:
         search_terms = []
     else:
         search_terms = _extract_search_terms(user_msg)
+        # ชั้นป้องกันสุดท้าย: ถ้าตัดคำฟุ่มเฟือยตามปกติแล้วยังเหลือคำค้น แต่ข้อความดิบ (ตัดช่องว่าง/
+        # อักขระแฝงแล้ว) กลับสั้นมากและเป็นส่วนหนึ่งของวลีปุ่มเมนูที่รู้จัก ก็ให้ถือว่าเป็นการกดเมนูอยู่ดี
+        # กันไว้เผื่อมีสัญลักษณ์แปลกปลอมที่ _extract_search_terms ไม่ได้ถูกออกแบบมาให้ตัด
+        if search_terms and any(
+            normalized_msg and normalized_msg in known
+            for known in _MENU_RANDOM_RECOMMEND_NORMALIZED
+        ):
+            search_terms = []
 
     search_attempted = bool(search_terms)
 
@@ -472,6 +488,10 @@ def callback():
 def handle_message(event):
     user_id = event.source.user_id
     user_msg = event.message.text.strip()
+
+    # DEBUG: พิมพ์ค่าดิบของข้อความที่ได้รับ (แบบ repr เห็นอักขระแฝง/ช่องว่างที่มองไม่เห็นด้วย)
+    # ไว้ตรวจสอบชั่วคราวว่าปุ่มเมนูส่งอะไรมาจริงๆ ลบบรรทัดนี้ทิ้งได้เมื่อแก้ปัญหาเสร็จแล้ว
+    print(f"DEBUG user_msg repr: {user_msg!r}")
 
     all_docs = fetch_all_books()
     books_context, search_attempted = get_books_context(all_docs, user_msg)
