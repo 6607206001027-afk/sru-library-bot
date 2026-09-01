@@ -55,6 +55,12 @@ if not firebase_admin._apps:
         ) from e
     cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
+else:
+    cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
+
+# เก็บ project_id ไว้โชว์ในหน้า /debug-books เพื่อวินิจฉัยปัญหา "ดึงหนังสือไม่เจอ" ได้เร็วขึ้น
+# (project_id ไม่ใช่ความลับ ต่างจาก private_key ที่อยู่ใน cred_dict แต่จะไม่เอาไปโชว์)
+FIREBASE_PROJECT_ID = cred_dict.get("project_id", "ไม่พบ project_id ใน credentials")
 
 db = firestore.client()
 app = Flask(__name__)
@@ -193,18 +199,40 @@ def _extract_search_terms(user_msg):
     return [p for p in parts if len(p) >= 2]
 
 
+# ชื่อ collection ที่เป็นไปได้ เผื่อของจริงใน Firestore สะกดหรือใช้ตัวพิมพ์ใหญ่/เล็กต่างจากที่โค้ดคาดไว้
+# ("books" คือชื่อหลักที่ควรใช้ ส่วนที่เหลือเป็น fallback กันเหนียวเท่านั้น)
+_BOOKS_COLLECTION_CANDIDATES = ["books", "Books", "BOOKS", "book", "Book"]
+
+
 def fetch_all_books():
     """
     ดึงหนังสือทั้งหมดจาก Firestore เพียงครั้งเดียวต่อข้อความ แล้วส่งต่อให้ทั้งฟังก์ชันค้นหา
     และฟังก์ชันนับหมวดหมู่ใช้ข้อมูลชุดเดียวกัน (เดิมแต่ละฟังก์ชันอ่าน Firestore แยกกันคนละรอบ
     ทำให้ช้าโดยไม่จำเป็น) ไม่ใส่ limit เพื่อให้การนับหมวดหมู่ยังแม่นยำเท่าของเดิมทุกประการ
+
+    ลองดึงจากชื่อ collection หลัก ("books") ก่อน ถ้าได้ผลลัพธ์ว่างเปล่า (ไม่ error แต่ 0 เอกสาร)
+    จะลองชื่อ collection แบบอื่นที่พบบ่อยเป็น fallback อัตโนมัติ กันปัญหาชื่อ collection สะกด/พิมพ์
+    ตัวใหญ่-เล็กไม่ตรงกับที่ตั้งไว้จริงใน Firebase Console พร้อม log จำนวนเอกสารที่ได้ทุกครั้งไว้ตรวจสอบ
     """
-    try:
-        return list(db.collection("books").stream())
-    except Exception as e:
-        print(f"❌ Firestore Read Error: {e}")
-        traceback.print_exc()
-        return []
+    for collection_name in _BOOKS_COLLECTION_CANDIDATES:
+        try:
+            docs = list(db.collection(collection_name).stream())
+        except Exception as e:
+            print(f"❌ Firestore Read Error (collection='{collection_name}'): {e}")
+            traceback.print_exc()
+            continue
+
+        if docs:
+            print(f"DEBUG fetch_all_books: found {len(docs)} doc(s) in collection '{collection_name}'")
+            return docs
+        else:
+            print(f"DEBUG fetch_all_books: collection '{collection_name}' exists but has 0 documents")
+
+    print(
+        "❌ fetch_all_books: ไม่พบเอกสารในทุก collection ที่ลอง "
+        f"({', '.join(_BOOKS_COLLECTION_CANDIDATES)}) — ตรวจสอบชื่อ collection ที่แท้จริงใน Firebase Console"
+    )
+    return []
 
 
 def get_books_context(all_docs, user_msg="", max_results=15, random_pick_count=5):
@@ -466,6 +494,32 @@ def create_flex_message(reply_text):
 @app.route("/", methods=["GET"])
 def health_check():
     return "บรรณารักษ์อัจฉริยะ กำลังทำงานอยู่ ✅", 200
+
+
+@app.route("/debug-books", methods=["GET"])
+def debug_books():
+    """
+    หน้าเว็บ debug ชั่วคราว เปิดดูตรงๆ ผ่านเบราว์เซอร์ได้เลยที่ /debug-books
+    บอกว่าบอทตัวนี้ต่อกับ Firebase project ไหนอยู่จริง (ไม่โชว์ private key)
+    และลองอ่านแต่ละชื่อ collection ที่เป็นไปได้ ว่าเจอกี่เอกสาร ชื่อเรื่องอะไรบ้าง
+    ใช้เช็คว่า "ดึงหนังสือไม่เจอ" เกิดจาก project ผิด หรือ collection ว่างจริง
+    ลบ route นี้ทิ้งได้เมื่อแก้ปัญหาเสร็จแล้ว (ไม่ควรเปิดค้างไว้ถาวรเพราะไม่มีการล็อกอิน)
+    """
+    result = {"firebase_project_id_connected": FIREBASE_PROJECT_ID, "collections_checked": {}}
+    for collection_name in _BOOKS_COLLECTION_CANDIDATES:
+        try:
+            docs = list(db.collection(collection_name).stream())
+            sample_titles = []
+            for d in docs[:5]:
+                b = d.to_dict()
+                sample_titles.append(_first(b, ["title", "Title", "book_name", "BookName"], "(ไม่มีฟิลด์ title)"))
+            result["collections_checked"][collection_name] = {
+                "document_count": len(docs),
+                "sample_titles": sample_titles,
+            }
+        except Exception as e:
+            result["collections_checked"][collection_name] = {"error": str(e)}
+    return result, 200
 
 
 @app.route("/callback", methods=["POST"])
