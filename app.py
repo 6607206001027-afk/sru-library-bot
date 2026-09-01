@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import random
 import traceback
 from flask import Flask, request, abort
 
@@ -127,20 +128,43 @@ def _first(d, keys, default=""):
 
 def _tokenize(text):
     """
-    ตัดข้อความเป็นชุดคำ (set) สำหรับเทียบหาความเกี่ยวข้อง รองรับทั้งไทยและอังกฤษ/ตัวเลข
+    ตัดข้อความเป็นชุดคำ (set) สำหรับคำ/วลีภาษาอังกฤษหรือตัวเลขที่มีการเว้นวรรคชัดเจน
     ใช้ regex จับกลุ่มตัวอักษรไทย+อังกฤษ+ตัวเลขติดกัน แล้วแปลงเป็นตัวพิมพ์เล็กทั้งหมด
+    หมายเหตุ: ใช้ไม่ได้ดีกับภาษาไทยที่พิมพ์ติดกันไม่เว้นวรรค (ซึ่งเป็นเรื่องปกติของภาษาไทย)
+    เพราะจะเห็นทั้งประโยคเป็น "คำเดียว" — สำหรับค้นหาหนังสือให้ใช้ _extract_search_terms() แทน
     """
     if not text:
         return set()
     return set(re.findall(r"[a-zA-Z0-9\u0E00-\u0E7F]+", str(text).lower()))
 
 
-# คำทั่วไปที่ไม่ควรเอามาช่วยกรองหนังสือ (พบบ่อยในทุกประโยคแต่ไม่ได้บ่งบอกเนื้อหาหนังสือ)
-_STOPWORDS = {
-    "หนังสือ", "แนะนำ", "มี", "ไหม", "ไหน", "หา", "ค้น", "ขอ", "อยาก", "อ่าน",
-    "ครับ", "ค่ะ", "คะ", "หน่อย", "บ้าง", "เกี่ยวกับ", "เรื่อง", "เล่ม", "ที่",
-    "จะ", "ให้", "ได้", "และ", "หรือ", "ใน", "ของ", "กับ", "ยืม", "สนใจ",
-}
+# วลีทั่วไปที่ไม่ควรเอามาช่วยกรองหนังสือ (พบบ่อยในทุกประโยคแต่ไม่ได้บ่งบอกเนื้อหาหนังสือ)
+# เรียงจากวลียาวไปสั้น เพื่อตัดวลีที่ยาวกว่าก่อน กันตัดคำผิดจากคำที่เป็นคำย่อยของกันและกัน
+_FILLER_PHRASES = [
+    "แนะนำหนังสือน่าอ่าน", "หนังสือน่าอ่าน", "อยากอ่านหนังสือ", "อยากได้หนังสือ",
+    "ขอหนังสือ", "หาหนังสือ", "ค้นหนังสือ", "มีหนังสือ", "แนะนำหนังสือ",
+    "เกี่ยวกับ", "หนังสือ", "แนะนำ", "น่าอ่าน", "ไหม", "ไหน", "หา", "ค้น",
+    "ขอ", "อยาก", "อ่าน", "ครับ", "ค่ะ", "คะ", "หน่อย", "บ้าง", "เรื่อง",
+    "เล่ม", "ที่", "จะ", "ให้", "ได้", "และ", "หรือ", "ใน", "ของ", "กับ",
+    "ยืม", "สนใจ", "มี",
+]
+
+
+def _extract_search_terms(user_msg):
+    """
+    เตรียมคำค้นสำหรับจับคู่กับหนังสือ โดยลบวลี/คำฟุ่มเฟือยออกจากข้อความก่อนด้วย string replace
+    (ไม่ใช่แยกเป็นชุดคำแล้วเทียบทีหลัง เพราะภาษาไทยไม่เว้นวรรคระหว่างคำ การแยกคำแบบ regex ทั่วไป
+    จะเห็นทั้งประโยคเป็นคำเดียว) เหลือแต่ส่วนที่น่าจะเป็นคำค้นจริงๆ ไว้ใช้เทียบแบบ substring ต่อ
+    คืนค่าเป็น list ของวลีที่เหลือ (อาจมีมากกว่า 1 ท่อนถ้าแยกด้วยช่องว่าง/เครื่องหมายวรรคตอน)
+    """
+    if not user_msg:
+        return []
+    cleaned = str(user_msg).lower()
+    for phrase in _FILLER_PHRASES:
+        cleaned = cleaned.replace(phrase, " ")
+    # แยกด้วยช่องว่าง/เครื่องหมายวรรคตอนที่เหลืออยู่ เก็บเฉพาะท่อนที่ยาวพอจะมีความหมาย
+    parts = re.split(r"[^a-zA-Z0-9\u0E00-\u0E7F]+", cleaned)
+    return [p for p in parts if len(p) >= 2]
 
 
 def fetch_all_books():
@@ -157,47 +181,46 @@ def fetch_all_books():
         return []
 
 
-def get_books_context(all_docs, user_msg="", max_results=15):
+def get_books_context(all_docs, user_msg="", max_results=15, random_pick_count=5):
     """
     ค้นหาหนังสือที่เกี่ยวข้องกับคำถามของผู้ใช้จริง แทนการหยิบเล่มแรกๆ ในฐานข้อมูลแบบสุ่ม
     รับ all_docs ที่ดึงมาแล้วจาก fetch_all_books() เพื่อไม่ต้องอ่าน Firestore ซ้ำ
     วิธีทำงาน:
-    1. ตัดคำในข้อความผู้ใช้ (ตัดคำ stopword ทั่วไปออก) แล้วให้คะแนนหนังสือแต่ละเล่ม
-       ตามว่ามีคำนั้นอยู่ใน ชื่อเรื่อง (คะแนนสูงสุด) / ผู้แต่ง+คำสำคัญ+บทคัดย่อ (คะแนนรอง) หรือไม่
+    1. ตัดคำฟุ่มเฟือยออกจากข้อความผู้ใช้ด้วย _extract_search_terms() (รองรับภาษาไทยไม่เว้นวรรค)
+       แล้วเทียบแบบ substring กับ ชื่อเรื่อง (คะแนนสูงสุด) / ผู้แต่ง+คำสำคัญ+บทคัดย่อ (คะแนนรอง)
     2. เรียงตามคะแนนมากไปน้อย เลือกเฉพาะเล่มที่มีคะแนน > 0 มาส่งให้ Gemini
-    3. ถ้าผู้ใช้ไม่ได้พิมพ์คำค้นที่เจาะจง (เช่น "แนะนำหนังสือหน่อย" เฉยๆ) จะไม่มีคำให้กรอง
-       กรณีนี้จะหยิบตัวอย่างเล่มแรกๆ มาให้แนะนำทั่วไปแทน (ไม่ใช่การค้นหาที่ล้มเหลว)
+    3. ถ้าตัดคำฟุ่มเฟือยออกแล้วไม่เหลือคำค้นที่มีความหมายเลย (เช่น "แนะนำหนังสือน่าอ่าน" ที่กดจากเมนู
+       หรือทักทายทั่วไป) ถือว่าเป็นการขอคำแนะนำทั่วไป — สุ่มหยิบ random_pick_count เล่มจากทั้งฐานข้อมูล
+       มาแนะนำ (สุ่มใหม่ทุกครั้งที่ถาม ไม่ใช่เล่มเดิมซ้ำๆ)
     คืนค่า: (books_text, search_attempted)
       - search_attempted = True หมายถึงผู้ใช้พิมพ์คำค้นเจาะจงแล้วแต่ไม่เจอเล่มที่ตรงเลย
     """
     if not all_docs:
         return "ไม่มีข้อมูลหนังสือในระบบ", False
 
-    query_tokens = _tokenize(user_msg) - _STOPWORDS
-    search_attempted = bool(query_tokens)
+    search_terms = _extract_search_terms(user_msg)
+    search_attempted = bool(search_terms)
 
     if search_attempted:
         scored = []
         for doc in all_docs:
             b = doc.to_dict()
-            title_tokens = _tokenize(_first(b, ["title", "Title", "book_name", "BookName"], ""))
+            title = str(_first(b, ["title", "Title", "book_name", "BookName"], "")).lower()
             other_text = " ".join(str(_first(b, k, "")) for k in [
                 ["author", "Author", "book_author"],
                 ["keywords", "Keyword", "subject", "Subject"],
                 ["abstract", "Abstract", "content", "Description"],
-            ])
-            other_tokens = _tokenize(other_text)
+            ]).lower()
 
             score = 0
-            for t in query_tokens:
-                if t in title_tokens:
+            for term in search_terms:
+                if term in title:
                     score += 3
-                elif t in other_tokens:
+                elif term in other_text:
                     score += 1
-                else:
-                    # เช็คคำที่เป็นส่วนหนึ่งของกันและกัน เผื่อพิมพ์คำค้นสั้น/ยาวกว่าคำในฐานข้อมูลเล็กน้อย
-                    if any(len(t) >= 3 and (t in w or w in t) for w in title_tokens):
-                        score += 2
+                elif title and title in term:
+                    # กรณีคำค้นยาวกว่าชื่อเรื่องจริง (พิมพ์ชื่อเต็มปนคำอื่นมา)
+                    score += 2
             if score > 0:
                 scored.append((score, doc))
 
@@ -207,8 +230,10 @@ def get_books_context(all_docs, user_msg="", max_results=15):
         if not selected_docs:
             return "ไม่พบหนังสือที่ตรงกับคำค้นนี้ในฐานข้อมูล", True
     else:
-        # ไม่มีคำค้นเจาะจง (เช่น ทักทายทั่วไป หรือขอคำแนะนำแบบกว้างๆ) — ใช้ตัวอย่างเล่มแรกๆ
-        selected_docs = all_docs[:max_results]
+        # ไม่มีคำค้นเจาะจง (เช่น กดปุ่มเมนู "แนะนำหนังสือน่าอ่าน" หรือทักทายทั่วไป)
+        # สุ่มหยิบมาแนะนำใหม่ทุกครั้ง แทนการหยิบเล่มแรกๆ ซ้ำเดิมทุกครั้ง
+        pool = all_docs
+        selected_docs = random.sample(pool, min(random_pick_count, len(pool)))
 
     books_data = []
     for doc in selected_docs:
@@ -410,7 +435,12 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "OK"
+    except Exception:
+        # กัน error อื่นๆ ที่ไม่คาดคิดทำให้ Flask ตอบ 500 ดิบๆ กลับ LINE
+        # (LINE จะเห็นแค่ 500 เฉยๆ ไม่มีรายละเอียด แต่เราจะเห็น traceback เต็มใน log ของ Render)
+        print("❌ Callback Error:", traceback.format_exc())
+        return "OK", 200
+    return "OK", 200
 
 
 @handler.add(MessageEvent, message=TextMessage)
